@@ -5,14 +5,17 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+
 // -------------------- WIFI CONFIGURATION --------------------
-const char* ssid = "PLDTHOMEFIBR432a0";           // ⚠️ USE 2.4GHz (remove 5G from name!)
+const char* ssid = "PLDTHOMEFIBR432a0";        
 const char* password = "PLDTWIFIcv3e9";
+
 // -------------------- MQTT CONFIGURATION --------------------
-const char* mqtt_broker = "afa96665cdc74a5ca2cbef61c459704e.s1.eu.hivemq.cloud";  // ⚠️ Replace with your HiveMQ cluster URL
+const char* mqtt_broker = "afa96665cdc74a5ca2cbef61c459704e.s1.eu.hivemq.cloud"; 
 const int mqtt_port = 8883;
-const char* mqtt_username = "esp32_apn";                   // ⚠️ Replace with your MQTT username
-const char* mqtt_password = "APN20250k";                   // ⚠️ Replace with your MQTT password
+const char* mqtt_username = "esp32_apn";                 
+const char* mqtt_password = "APN20250k";      
+
 // HiveMQ Cloud Root CA Certificate (ISRG Root X1 - Let's Encrypt)
 const char* root_ca = R"EOF(
 -----BEGIN CERTIFICATE-----
@@ -47,66 +50,91 @@ mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
 emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----
 )EOF";
+
 // -------------------- DEVICE ID (from MAC address) --------------------
 String deviceId;
 String telemetryTopic;
 String commandTopic;
+
 // -------------------- PIN CONFIG --------------------
 #define WATER1 32
 #define WATER2 33
 #define WATER3 34
 #define WATER4 35
+
 #define GAS_DO 27
+
 #define TEMP1 25
 #define TEMP2 26
+
 #define VOLTAGE_SENSOR_1 14
 #define VOLTAGE_SENSOR_2 12
 #define CURRENT_SENSOR_1 13
 #define CURRENT_SENSOR_2 15
+
 #define BUZZER 19
+
 #define SERVO_GYRO_1 16
 #define SERVO_GYRO_2 17
 #define BREAKER_SERVO_1 18
 #define BREAKER_SERVO_2 23
+
 // -------------------- THRESHOLDS --------------------
 int waterThreshold = 500;
 float tempThreshold = 50.0;
 float gyroThreshold = 15.0;
 float voltageThreshold = 3000;
 float currentThreshold = 2000;
+
 float tempWarningLevel = 40.0;
 float voltageWarning = 2500;
 float currentWarning = 1500;
+
 // -------------------- SENSOR ENABLE FLAGS --------------------
 bool enableVoltageSensors = false;
 bool enableCurrentSensors = false;
+
 // -------------------- SERVO CONFIG --------------------
 Servo servoGyro1;
 Servo servoGyro2;
 Servo breakerServo1;
 Servo breakerServo2;
-int gyroRestAngle = 90;
-int gyroShakeAngle1 = 45;
-int gyroShakeAngle2 = 135;
-int breakerOnAngle = 90;
-int breakerOffAngle = 0;
-bool breaker1State = true;
+
+int gyroRestAngle = 90;      // Center position for gyro servos
+int gyroShakeAngle1 = 45;    // Left shake position
+int gyroShakeAngle2 = 135;   // Right shake position
+
+// BREAKER SERVO ANGLES - NEW BEHAVIOR
+int breakerOnAngle = 90;      // Breaker ON position (ready state)
+int breakerOffAngle = 0;      // Breaker TRIP position (pushes breaker off)
+
+// Breaker states - now tracks LOGICAL state, not servo position
+bool breaker1State = true;    
 bool breaker2State = true;
-unsigned long lastGyroTestTime = 0;
-unsigned long gyroTestInterval = 10000;
-bool autoGyroTest = false;
+
+// Timing for auto-return
+unsigned long breaker1TripTime = 0;
+unsigned long breaker2TripTime = 0;
+const unsigned long autoReturnDelay = 1000;  // 1 second after trip, servo returns
+
+
 // -------------------- STATE TRACKING --------------------
 unsigned long lastAlertTime = 0;
 unsigned long alertCooldown = 5000;
 int alertCount = 0;
 unsigned long statusInterval = 30000;
 unsigned long lastStatusTime = 0;
+
 // Alert state tracking (for cleared alerts)
 bool waterAlertActive = false;
 bool gasAlertActive = false;
 bool tempAlertActive = false;
 bool gyroAlertActive = false;
 bool powerAlertActive = false;
+
+bool breakersTrippedByAlert = false;  // Prevents continuous re-tripping
+
+
 // -------------------- STATE CHANGE TRACKING --------------------
 bool prevWaterDetected = false;
 bool prevGasDetected = false;
@@ -115,24 +143,30 @@ bool prevTempWarning = false;
 bool prevGyroDetected = false;
 bool prevPowerCritical = false;
 bool prevPowerWarning = false;
+
 bool prevWifiConnected = false;
 bool prevMqttConnected = false;
 bool prevBreaker1State = true;
 bool prevBreaker2State = true;
 bool prevSystemEnabled = true;
 bool prevBuzzerEnabled = true;
+
 // Heartbeat
 unsigned long lastHeartbeat = 0;
 unsigned long heartbeatInterval = 60000;  // Print status every 60 seconds (0 to disable)
+
 // Periodic status update (sends sensor data to database at regular intervals)
 unsigned long lastPeriodicUpdate = 0;
 unsigned long periodicUpdateInterval = 30000;  // 30 seconds interval for sensor readings
 bool enablePeriodicUpdates = true;  // Enabled - sensor data stored every 30 seconds
+
 // WiFi tracking
 unsigned long lastWiFiCheck = 0;
 bool wifiConnecting = false;
+
 // -------------------- MPU OBJECT --------------------
 MPU6050 mpu(Wire);
+
 // -------------------- MQTT CLIENT --------------------
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
@@ -143,9 +177,11 @@ unsigned long lastDataSendTime = 0;
 unsigned long dataSendInterval = 2000;
 bool systemEnabled = true;
 bool buzzerEnabled = true;
+
 // -------------------- JSON BUFFER --------------------
 StaticJsonDocument<1024> jsonDoc;
 StaticJsonDocument<512> jsonReceive;
+
 // ===================================================================
 // FORWARD DECLARATIONS
 // ===================================================================
@@ -161,6 +197,7 @@ void printHelp();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 bool mqttReconnect();
 String getDeviceId();
+
 // ===================================================================
 // DEVICE ID GENERATION
 // ===================================================================
@@ -171,8 +208,9 @@ String getDeviceId() {
   sprintf(macStr, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return String(macStr);
 }
+
 // ===================================================================
-// ENHANCED MQTT CALLBACK WITH APP COMMAND FORMAT SUPPORT
+// MQTT FUNCTIONS
 // ===================================================================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // Create a null-terminated string from payload
@@ -180,79 +218,19 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   memcpy(message, payload, length);
   message[length] = '\0';
   
-  Serial.println("\n╔═══════════════════════════════════╗");
-  Serial.println("║     📨 MQTT MESSAGE RECEIVED      ║");
-  Serial.println("╠═══════════════════════════════════╣");
-  Serial.print("║  Topic: ");
-  Serial.print(topic);
-  
-  // Pad the line to match box width
-  int topicLen = strlen(topic);
-  for(int i = topicLen; i < 24; i++) Serial.print(" ");
-  Serial.println("║");
-  
-  Serial.println("║  Payload:                         ║");
-  Serial.print("║  ");
-  
-  // Print payload with word wrap if needed
-  if (length <= 33) {
-    Serial.print(message);
-    for(unsigned int i = length; i < 33; i++) Serial.print(" ");
-    Serial.println("║");
-  } else {
-    // Print first 33 chars
-    for(int i = 0; i < 33; i++) {
-      Serial.print(message[i]);
-    }
-    Serial.println("║");
-    Serial.println("║  (truncated for display)          ║");
-  }
-  Serial.println("╚═══════════════════════════════════╝\n");
+  Serial.print("📨 MQTT Message on topic: ");
+  Serial.println(topic);
+  Serial.print("   Payload: ");
+  Serial.println(message);
   
   // Parse the JSON command
   DeserializationError error = deserializeJson(jsonReceive, message);
   
   if (error) {
-    Serial.print("❌ JSON Parse Error: ");
-    Serial.println(error.c_str());
-    sendErrorResponse("Invalid JSON format");
+    Serial.println("❌ Error parsing MQTT message");
     return;
   }
   
-  // Validate device ID if present
-  if (jsonReceive.containsKey("deviceId")) {
-    String receivedDeviceId = jsonReceive["deviceId"].as<String>();
-    if (receivedDeviceId != deviceId) {
-      Serial.println("⚠️  WARNING: Command deviceId mismatch!");
-      Serial.print("   Expected: ");
-      Serial.println(deviceId);
-      Serial.print("   Received: ");
-      Serial.println(receivedDeviceId);
-      Serial.println("   Ignoring command for safety.\n");
-      return;
-    } else {
-      Serial.print("✅ Device ID verified: ");
-      Serial.println(deviceId);
-    }
-  }
-  
-  // Log timestamp if present
-  if (jsonReceive.containsKey("timestamp")) {
-    String timestamp = jsonReceive["timestamp"].as<String>();
-    Serial.print("⏰ Command timestamp: ");
-    Serial.println(timestamp);
-  }
-  
-  // Log command type if present
-  if (jsonReceive.containsKey("type")) {
-    String msgType = jsonReceive["type"].as<String>();
-    Serial.print("📋 Message type: ");
-    Serial.println(msgType);
-  }
-  
-  Serial.println();
-  
-  // Handle the command
   handleIncomingCommand();
 }
 
@@ -261,194 +239,247 @@ void handleIncomingCommand() {
     String command = jsonReceive["command"].as<String>();
     command.toUpperCase();
     
-    Serial.println("╔═══════════════════════════════════╗");
-    Serial.print("║  🔥 Executing: ");
+    Serial.println("\n╔═══════════════════════════════════╗");
+    Serial.print("║  Command: ");
     Serial.print(command);
     
     // Pad to match box width
-    for(int i = command.length(); i < 19; i++) Serial.print(" ");
+    for(int i = command.length(); i < 21; i++) Serial.print(" ");
     Serial.println("║");
     Serial.println("╚═══════════════════════════════════╝\n");
     
-    // =============== SYSTEM CONTROL ===============
+    
     if (command == "SYSTEM_ON") {
       systemEnabled = true;
-      Serial.println("✅ System ENABLED");
       sendAckResponse("System enabled");
-      
-    } else if (command == "SYSTEM_OFF") {
+    } 
+    else if (command == "SYSTEM_OFF") {
       systemEnabled = false;
       digitalWrite(BUZZER, LOW);
-      Serial.println("✅ System DISABLED");
       sendAckResponse("System disabled");
-      
-    // =============== BUZZER CONTROL ===============
-    } else if (command == "BUZZER_ON") {
+    } 
+    else if (command == "BUZZER_ON") {
       buzzerEnabled = true;
-      Serial.println("✅ Buzzer ENABLED");
       sendAckResponse("Buzzer enabled");
       
     } else if (command == "BUZZER_OFF") {
       buzzerEnabled = false;
       digitalWrite(BUZZER, LOW);
-      Serial.println("✅ Buzzer MUTED");
       sendAckResponse("Buzzer muted");
       
-    // =============== STATUS REQUEST ===============
     } else if (command == "REQUEST_STATUS") {
-      Serial.println("📊 Sending current status...");
       sendSensorData(true);
-      sendSystemStatus();
       
-    // =============== CALIBRATION ===============
     } else if (command == "CALIBRATE_GYRO") {
-      Serial.println("🔧 Calibrating gyroscope...");
-      Serial.println("⚠️  Keep device STATIONARY for 10 seconds");
       mpu.calcGyroOffsets(true);
-      Serial.println("✅ Gyro calibration complete");
-      sendAckResponse("Gyro calibrated successfully");
+      sendAckResponse("Gyro calibrated");
       
-    // =============== SYSTEM RESET ===============
     } else if (command == "RESET_SYSTEM") {
-      Serial.println("🔄 SYSTEM RESET requested");
-      sendAckResponse("System resetting in 2 seconds...");
-      delay(2000);
-      Serial.println("♻️  Restarting ESP32...");
+      sendAckResponse("System resetting");
+      delay(500);
       ESP.restart();
       
-    // =============== SHAKE TEST ===============
     } else if (command == "SHAKE_TEST") {
-      Serial.println("🔧 Starting shake test (30 seconds)");
-      sendAckResponse("Shake test started - 30 seconds");
       testGyroShake();
-      sendAckResponse("Shake test completed successfully");
-      Serial.println("✅ Shake test complete");
+      sendAckResponse("Shake test completed");
       
     // =============== BREAKER CONTROLS ===============
     } else if (command == "BREAKER1_ON") {
-      Serial.println("⚡ Turning Breaker 1 ON");
-      setBreakerState(1, true);
-      sendAckResponse("Breaker 1 is now ON");
+      Serial.println("👤 User command: Reset Breaker 1 to ON");
+      breaker1State = true;
+      
+      if (!breakerServo1.attached()) {
+        breakerServo1.attach(BREAKER_SERVO_1);
+        delay(100);
+      }
+      
+      breakerServo1.write(breakerOnAngle);
+      delay(200);
+      
+      Serial.println("✅ Breaker 1: Circuit ON");
+      sendAckResponse("Breaker 1 reset to ON");
       
     } else if (command == "BREAKER1_OFF") {
-      Serial.println("⚡ Tripping Breaker 1 OFF");
-      setBreakerState(1, false);
-      sendAckResponse("Breaker 1 is now OFF");
+      Serial.println("🚨 Command: Trip Breaker 1 OFF");
+      breaker1State = false;
+      
+      if (!breakerServo1.attached()) {
+        breakerServo1.attach(BREAKER_SERVO_1);
+        delay(100);
+      }
+      
+      breakerServo1.write(breakerOnAngle);
+      delay(100);
+      
+      Serial.println("   Moving servo to TRIP position...");
+      for (int pos = breakerOnAngle; pos >= breakerOffAngle; pos -= 5) {
+        breakerServo1.write(pos);
+        delay(10);
+      }
+      breakerServo1.write(breakerOffAngle);
+      delay(500);
+      
+      Serial.println("   Servo returning to ready position...");
+      for (int pos = breakerOffAngle; pos <= breakerOnAngle; pos += 3) {
+        breakerServo1.write(pos);
+        delay(15);
+      }
+      breakerServo1.write(breakerOnAngle);
+      
+      breaker1TripTime = millis();
+      Serial.println("✅ Breaker 1: Tripped (Circuit OFF)");
+      sendAckResponse("Breaker 1 tripped OFF");
       
     } else if (command == "BREAKER2_ON") {
-      Serial.println("⚡ Turning Breaker 2 ON");
-      setBreakerState(2, true);
-      sendAckResponse("Breaker 2 is now ON");
+      Serial.println("👤 User command: Reset Breaker 2 to ON");
+      breaker2State = true;
+      
+      if (!breakerServo2.attached()) {
+        breakerServo2.attach(BREAKER_SERVO_2);
+        delay(100);
+      }
+      
+      breakerServo2.write(breakerOnAngle);
+      delay(200);
+      
+      Serial.println("✅ Breaker 2: Circuit ON");
+      sendAckResponse("Breaker 2 reset to ON");
       
     } else if (command == "BREAKER2_OFF") {
-      Serial.println("⚡ Tripping Breaker 2 OFF");
-      setBreakerState(2, false);
-      sendAckResponse("Breaker 2 is now OFF");
+      Serial.println("🚨 Command: Trip Breaker 2 OFF");
+      breaker2State = false;
+      
+      if (!breakerServo2.attached()) {
+        breakerServo2.attach(BREAKER_SERVO_2);
+        delay(100);
+      }
+      
+      breakerServo2.write(breakerOnAngle);
+      delay(100);
+      
+      Serial.println("   Moving servo to TRIP position...");
+      for (int pos = breakerOnAngle; pos >= breakerOffAngle; pos -= 5) {
+        breakerServo2.write(pos);
+        delay(10);
+      }
+      breakerServo2.write(breakerOffAngle);
+      delay(500);
+      
+      Serial.println("   Servo returning to ready position...");
+      for (int pos = breakerOffAngle; pos <= breakerOnAngle; pos += 3) {
+        breakerServo2.write(pos);
+        delay(15);
+      }
+      breakerServo2.write(breakerOnAngle);
+      
+      breaker2TripTime = millis();
+      Serial.println("✅ Breaker 2: Tripped (Circuit OFF)");
+      sendAckResponse("Breaker 2 tripped OFF");
       
     } else if (command == "TRIP_ALL") {
-      Serial.println("🚨 TRIPPING ALL BREAKERS");
+      Serial.println("🚨 EMERGENCY: Tripping ALL breakers!");
       tripAllBreakers();
-      sendAckResponse("All breakers have been tripped");
+      sendAckResponse("All breakers tripped");
       
     } else if (command == "RESET_ALL") {
-      Serial.println("🔄 RESETTING ALL BREAKERS");
-      resetAllBreakers();
-      sendAckResponse("All breakers have been reset to ON");
+      Serial.println("👤 User command: Reset all breakers");
+      breaker1State = true;
+      breaker2State = true;
       
-    // =============== DIAGNOSTIC COMMANDS ===============
-    } else if (command == "GET_DIAGNOSTICS") {
-      Serial.println("🔍 Generating diagnostic report...");
-      sendDiagnosticReport();
+      if (!breakerServo1.attached()) breakerServo1.attach(BREAKER_SERVO_1);
+      if (!breakerServo2.attached()) breakerServo2.attach(BREAKER_SERVO_2);
+      delay(100);
       
-    } else if (command == "TEST_BUZZER") {
-      Serial.println("🔊 Testing buzzer...");
-      for(int i = 0; i < 3; i++) {
-        digitalWrite(BUZZER, HIGH);
-        delay(200);
-        digitalWrite(BUZZER, LOW);
-        delay(200);
-      }
-      sendAckResponse("Buzzer test complete");
+      breakerServo1.write(breakerOnAngle);
+      breakerServo2.write(breakerOnAngle);
+      delay(200);
       
-    } else if (command == "GET_THRESHOLDS") {
-      Serial.println("📊 Sending current thresholds...");
-      sendSystemStatus();
+      Serial.println("✅ All breakers reset to ON");
+      sendAckResponse("All breakers reset to ON");
+
+    } else if (command == "GET_BREAKER_STATUS") {
+      Serial.println("📊 Sending breaker status...");
+      sendBreakerStatus();
       
-    // =============== UNKNOWN COMMAND ===============
     } else {
-      Serial.print("❌ Unknown command: ");
-      Serial.println(command);
-      sendErrorResponse("Unknown command: " + command);
+      Serial.println("⚠️ Unknown command: " + command);
     }
   }
-  
-  // =============== THRESHOLD CONFIGURATION ===============
   else if (jsonReceive.containsKey("set_thresholds")) {
-    Serial.println("⚙️  Updating thresholds...");
     JsonObject thresholds = jsonReceive["set_thresholds"];
-    
-    bool updated = false;
     
     if (thresholds.containsKey("water")) {
       waterThreshold = thresholds["water"];
-      Serial.printf("   💧 Water threshold: %d\n", waterThreshold);
-      updated = true;
     }
     if (thresholds.containsKey("temperature")) {
       tempThreshold = thresholds["temperature"];
-      Serial.printf("   🌡️  Temperature threshold: %.1f°C\n", tempThreshold);
-      updated = true;
     }
     if (thresholds.containsKey("gyro")) {
       gyroThreshold = thresholds["gyro"];
-      Serial.printf("   📳 Gyro threshold: %.2f\n", gyroThreshold);
-      updated = true;
     }
     if (thresholds.containsKey("voltage")) {
       voltageThreshold = thresholds["voltage"];
-      Serial.printf("   ⚡ Voltage threshold: %.0f\n", voltageThreshold);
-      updated = true;
     }
     if (thresholds.containsKey("current")) {
       currentThreshold = thresholds["current"];
-      Serial.printf("   🔋 Current threshold: %.0f\n", currentThreshold);
-      updated = true;
     }
     
-    if (updated) {
-      Serial.println("✅ Thresholds updated successfully");
-      sendAckResponse("Thresholds updated");
-      sendSystemStatus();  // Send updated configuration
-    } else {
-      Serial.println("⚠️  No valid threshold fields found");
-      sendErrorResponse("No valid threshold fields");
-    }
-  }
-  
-  // =============== UNKNOWN MESSAGE FORMAT ===============
-  else {
-    Serial.println("❌ Message missing required fields");
-    sendErrorResponse("Invalid message format - no command or threshold data");
+    sendAckResponse("Thresholds updated");
+    sendSystemStatus();
   }
 }
+
+void sendBreakerStatus() {
+  if (!mqttClient.connected()) return;
+  
+  jsonDoc.clear();
+  jsonDoc["message_type"] = "BREAKER_STATUS";
+  jsonDoc["device_id"] = deviceId;
+  
+  JsonObject b1 = jsonDoc.createNestedObject("breaker1");
+  b1["state"] = breaker1State ? "ON" : "OFF";
+  b1["circuit"] = breaker1State ? "CLOSED" : "OPEN";
+  b1["last_trip"] = breaker1TripTime;
+  
+  JsonObject b2 = jsonDoc.createNestedObject("breaker2");
+  b2["state"] = breaker2State ? "ON" : "OFF";
+  b2["circuit"] = breaker2State ? "CLOSED" : "OPEN";
+  b2["last_trip"] = breaker2TripTime;
+  
+  jsonDoc["timestamp"] = millis() / 1000;
+  jsonDoc["type"] = "status_update";
+  
+  String output;
+  serializeJson(jsonDoc, output);
+  publishMessage(output.c_str());
+  
+  Serial.println("✅ Breaker status sent");
+}
+
 
 bool mqttReconnect() {
   if (WiFi.status() != WL_CONNECTED) {
     return false;
   }
+  
   String clientId = "ESP32-" + deviceId;
+  
   Serial.print("📡 MQTT: Connecting to ");
   Serial.print(mqtt_broker);
   Serial.print(" as ");
   Serial.println(clientId);
+  
   if (mqttClient.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
     Serial.println("✅ MQTT: Connected!");
+    
     // Subscribe to command topic
     mqttClient.subscribe(commandTopic.c_str(), 1);
     Serial.print("📬 MQTT: Subscribed to ");
     Serial.println(commandTopic);
+    
     // Send initial status
     sendSystemStatus();
+    
     return true;
   } else {
     Serial.print("❌ MQTT: Connection failed, rc=");
@@ -456,17 +487,20 @@ bool mqttReconnect() {
     return false;
   }
 }
+
 void publishMessage(const char* payload) {
   if (!mqttClient.connected()) {
     Serial.println("⚠️ MQTT: Not connected, cannot publish");
     return;
   }
+  
   if (mqttClient.publish(telemetryTopic.c_str(), payload, false)) {
     Serial.println("📤 MQTT: Message published");
   } else {
     Serial.println("❌ MQTT: Publish failed");
   }
 }
+
 // ===================================================================
 // SERVO CONTROL FUNCTIONS
 // ===================================================================
@@ -475,78 +509,260 @@ void initServos() {
   servoGyro2.attach(SERVO_GYRO_2);
   breakerServo1.attach(BREAKER_SERVO_1);
   breakerServo2.attach(BREAKER_SERVO_2);
+  
   servoGyro1.write(gyroRestAngle);
   servoGyro2.write(gyroRestAngle);
   breakerServo1.write(breakerOnAngle);
   breakerServo2.write(breakerOnAngle);
+  
   delay(500);
 }
+
 void testGyroShake() {
   Serial.println("🔧 Starting 30-second gyro shake test...");
+  
+  // Ensure servos are attached before starting
+  if (!servoGyro1.attached()) {
+    Serial.println("⚠️  Servo 1 not attached, reattaching...");
+    servoGyro1.attach(SERVO_GYRO_1);
+    delay(100);
+  }
+  if (!servoGyro2.attached()) {
+    Serial.println("⚠️  Servo 2 not attached, reattaching...");
+    servoGyro2.attach(SERVO_GYRO_2);
+    delay(100);
+  }
+  
+  // Move to rest position first
+  servoGyro1.write(gyroRestAngle);
+  servoGyro2.write(gyroRestAngle);
+  delay(200);
+  
   unsigned long shakeStartTime = millis();
   unsigned long shakeDuration = 30000;
+  int cycleCount = 0;
+  
+  Serial.println("📳 Servos activated - shaking for 30 seconds...");
+  
   while (millis() - shakeStartTime < shakeDuration) {
+    // Ensure servos stay attached during operation
+    if (!servoGyro1.attached()) {
+      servoGyro1.attach(SERVO_GYRO_1);
+    }
+    if (!servoGyro2.attached()) {
+      servoGyro2.attach(SERVO_GYRO_2);
+    }
+    
+    // Shake pattern: alternate between angles
     servoGyro1.write(gyroShakeAngle1);
     servoGyro2.write(gyroShakeAngle2);
     delay(150);
+    
     servoGyro1.write(gyroShakeAngle2);
     servoGyro2.write(gyroShakeAngle1);
     delay(150);
+    
     servoGyro1.write(gyroRestAngle);
     servoGyro2.write(gyroRestAngle);
     delay(100);
+    
+    cycleCount++;
+    
     unsigned long elapsed = millis() - shakeStartTime;
     if (elapsed % 5000 < 400) {
       Serial.print("  ⏱️  ");
       Serial.print(elapsed / 1000);
-      Serial.println("s elapsed...");
+      Serial.print("s elapsed (");
+      Serial.print(cycleCount);
+      Serial.println(" cycles)...");
     }
+    
     // Keep MQTT alive during long operation
     mqttClient.loop();
+    
+    // Small yield to prevent watchdog issues
+    yield();
   }
+  
+  // Return to rest position
   servoGyro1.write(gyroRestAngle);
   servoGyro2.write(gyroRestAngle);
-  Serial.println("✅ 30-second gyro test complete");
+  delay(200);
+  
+  Serial.print("✅ 30-second gyro test complete (");
+  Serial.print(cycleCount);
+  Serial.println(" cycles)");
 }
+
 void setBreakerState(int breakerNum, bool state) {
+  // Select the correct servo and state variables
+  Servo* servo;
+  bool* breakerStatePtr;
+  unsigned long* tripTimePtr;
+  int servoPin;
+  
   if (breakerNum == 1) {
-    breaker1State = state;
-    if (state) {
-      for (int pos = breakerOffAngle; pos <= breakerOnAngle; pos += 10) {
-        breakerServo1.write(pos);
-        delay(10);
-      }
-    } else {
-      for (int pos = breakerOnAngle; pos >= breakerOffAngle; pos -= 10) {
-        breakerServo1.write(pos);
-        delay(10);
-      }
+    servo = &breakerServo1;
+    breakerStatePtr = &breaker1State;
+    tripTimePtr = &breaker1TripTime;
+    servoPin = BREAKER_SERVO_1;
+  } else {
+    servo = &breakerServo2;
+    breakerStatePtr = &breaker2State;
+    tripTimePtr = &breaker2TripTime;
+    servoPin = BREAKER_SERVO_2;
+  }
+  
+  // Ensure servo is attached (fixes issues after first run)
+  if (!servo->attached()) {
+    Serial.printf("⚠️  Breaker servo %d not attached, reattaching...\n", breakerNum);
+    servo->attach(servoPin);
+    delay(100);
+  }
+  
+  // Update the state
+  *breakerStatePtr = state;
+  
+  if (state) {
+    // ============ TURNING BREAKER ON (User manually resets) ============
+    Serial.printf("⚡ Breaker %d: User manually turning ON...\n", breakerNum);
+    
+    // Servo should already be at ready position due to auto-return
+    // Just ensure it's at the correct position (no movement needed)
+    servo->write(breakerOnAngle);
+    delay(200);
+    
+    Serial.printf("✅ Breaker %d: Circuit ON (Ready)\n", breakerNum);
+    
+  } else {
+    // ============ TRIPPING BREAKER OFF ============
+    Serial.printf("🚨 Breaker %d: TRIPPING OFF...\n", breakerNum);
+    
+    // Ensure servo starts at ready position
+    servo->write(breakerOnAngle);
+    delay(100);
+    
+    // Quickly move to OFF position to trip the breaker
+    for (int pos = breakerOnAngle; pos >= breakerOffAngle; pos -= 10) {
+      servo->write(pos);
+      delay(8);  // Fast trip
     }
-    breakerServo1.write(state ? breakerOnAngle : breakerOffAngle);
-  } else if (breakerNum == 2) {
-    breaker2State = state;
-    if (state) {
-      for (int pos = breakerOffAngle; pos <= breakerOnAngle; pos += 10) {
-        breakerServo2.write(pos);
-        delay(10);
-      }
-    } else {
-      for (int pos = breakerOnAngle; pos >= breakerOffAngle; pos -= 10) {
-        breakerServo2.write(pos);
-        delay(10);
-      }
+    servo->write(breakerOffAngle);
+    delay(200);  // Hold at trip position briefly
+    
+    Serial.printf("⚡ Breaker %d: Circuit TRIPPED (OFF)\n", breakerNum);
+    
+    // Record the trip time for tracking
+    *tripTimePtr = millis();
+    
+    // Wait before returning to ready position
+    delay(autoReturnDelay);
+    
+    Serial.printf("🔄 Breaker %d: Servo returning to ready position...\n", breakerNum);
+    
+    // Slowly return to ready position (servo only, circuit stays OFF)
+    for (int pos = breakerOffAngle; pos <= breakerOnAngle; pos += 3) {
+      servo->write(pos);
+      delay(20);
     }
-    breakerServo2.write(state ? breakerOnAngle : breakerOffAngle);
+    servo->write(breakerOnAngle);
+    delay(100);
+    
+    Serial.printf("✅ Breaker %d: Servo ready (Circuit still OFF - needs manual reset)\n", breakerNum);
   }
 }
+
 void tripAllBreakers() {
-  setBreakerState(1, false);
-  setBreakerState(2, false);
+  Serial.println("\n╔═══════════════════════════════════╗");
+  Serial.println("║   🚨 EMERGENCY - TRIPPING ALL    ║");
+  Serial.println("║        CIRCUIT BREAKERS!          ║");
+  Serial.println("╚═══════════════════════════════════╝\n");
+  
+  // Ensure servos are attached
+  if (!breakerServo1.attached()) {
+    breakerServo1.attach(BREAKER_SERVO_1);
+    delay(50);
+  }
+  if (!breakerServo2.attached()) {
+    breakerServo2.attach(BREAKER_SERVO_2);
+    delay(50);
+  }
+  
+  // Update both breaker states immediately
+  breaker1State = false;
+  breaker2State = false;
+  
+  // Ensure servos start at ready position
+  breakerServo1.write(breakerOnAngle);
+  breakerServo2.write(breakerOnAngle);
+  delay(100);
+  
+  Serial.println("🚨 Tripping both breakers simultaneously...");
+  
+  // Trip both breakers at the same time
+  for (int pos = breakerOnAngle; pos >= breakerOffAngle; pos -= 10) {
+    breakerServo1.write(pos);
+    breakerServo2.write(pos);
+    delay(8);
+  }
+  breakerServo1.write(breakerOffAngle);
+  breakerServo2.write(breakerOffAngle);
+  delay(200);  // Hold at trip position
+  
+  Serial.println("⚡ Both circuits TRIPPED (OFF)");
+  
+  // Record trip times
+  unsigned long tripTime = millis();
+  breaker1TripTime = tripTime;
+  breaker2TripTime = tripTime;
+  
+  // Wait before returning to ready position
+  delay(autoReturnDelay);
+  
+  Serial.println("🔄 Both servos returning to ready position...");
+  
+  // Return both servos to ready position
+  for (int pos = breakerOffAngle; pos <= breakerOnAngle; pos += 3) {
+    breakerServo1.write(pos);
+    breakerServo2.write(pos);
+    delay(20);
+  }
+  breakerServo1.write(breakerOnAngle);
+  breakerServo2.write(breakerOnAngle);
+  delay(100);
+  
+  Serial.println("✅ Both servos ready (Circuits still OFF - need manual reset)");
+  Serial.println("\n⚠️  Both circuits are now OFF");
+  Serial.println("👉 User must manually reset breakers to restore power\n");
 }
+
+// ===================================================================
+// UPDATED: resetAllBreakers - USER MANUAL RESET
+// ===================================================================
 void resetAllBreakers() {
-  setBreakerState(1, true);
-  setBreakerState(2, true);
+  Serial.println("\n╔═══════════════════════════════════╗");
+  Serial.println("║   🔄 USER MANUALLY RESETTING      ║");
+  Serial.println("║        ALL BREAKERS               ║");
+  Serial.println("╚═══════════════════════════════════╝\n");
+  
+  // Update both breaker states
+  breaker1State = true;
+  breaker2State = true;
+  
+  Serial.println("⚡ Resetting both breakers simultaneously...");
+  
+  // Reset both breakers together
+  for (int pos = breakerOffAngle; pos <= breakerOnAngle; pos += 5) {
+    breakerServo1.write(pos);
+    breakerServo2.write(pos);
+    delay(15);
+  }
+  breakerServo1.write(breakerOnAngle);
+  breakerServo2.write(breakerOnAngle);
+  
+  Serial.println("✅ Both circuits restored to ON\n");
 }
+
 // ===================================================================
 // BUZZER PATTERNS
 // ===================================================================
@@ -557,6 +773,7 @@ void buzzWater() {
   digitalWrite(BUZZER, LOW);
   delay(300);
 }
+
 void buzzGas() {
   if (!buzzerEnabled) return;
   digitalWrite(BUZZER, HIGH);
@@ -564,6 +781,7 @@ void buzzGas() {
   digitalWrite(BUZZER, LOW);
   delay(100);
 }
+
 void buzzTemp() {
   if (!buzzerEnabled) return;
   digitalWrite(BUZZER, HIGH);
@@ -571,6 +789,7 @@ void buzzTemp() {
   digitalWrite(BUZZER, LOW);
   delay(300);
 }
+
 void buzzGyro() {
   if (!buzzerEnabled) return;
   for (int i = 0; i < 3; i++) {
@@ -580,6 +799,7 @@ void buzzGyro() {
     delay(120);
   }
 }
+
 void buzzPower() {
   if (!buzzerEnabled) return;
   for (int i = 0; i < 2; i++) {
@@ -589,6 +809,7 @@ void buzzPower() {
     delay(200);
   }
 }
+
 void buzzCritical() {
   if (!buzzerEnabled) return;
   for (int i = 0; i < 5; i++) {
@@ -598,6 +819,7 @@ void buzzCritical() {
     delay(80);
   }
 }
+
 void buzzWarning() {
   if (!buzzerEnabled) return;
   digitalWrite(BUZZER, HIGH);
@@ -605,6 +827,7 @@ void buzzWarning() {
   digitalWrite(BUZZER, LOW);
   delay(500);
 }
+
 // ===================================================================
 // SENSOR READING FUNCTIONS
 // ===================================================================
@@ -612,13 +835,16 @@ float readTemp(int pin) {
   int raw = analogRead(pin);
   return (raw * 3.3 / 4095.0) * 100;
 }
+
 float convertVoltage(int reading) {
   return (reading * 3.3 / 4095.0) * 5.0;
 }
+
 float convertCurrent(int reading) {
   float voltage = reading * 3.3 / 4095.0;
   return (voltage - 1.65) / 0.066;
 }
+
 // ===================================================================
 // HELPER FUNCTIONS FOR SERIAL OUTPUT
 // ===================================================================
@@ -626,6 +852,7 @@ void printWiFiInfo() {
   Serial.println("\n╔═══════════════════════════════════╗");
   Serial.println("║         WiFi Information          ║");
   Serial.println("╠═══════════════════════════════════╣");
+  
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("║  Status: ✅ CONNECTED             ║");
     Serial.print("║  SSID: ");
@@ -647,9 +874,11 @@ void printWiFiInfo() {
   }
   Serial.println("╚═══════════════════════════════════╝\n");
 }
+
 void scanNetworks() {
   Serial.println("\n🔍 Scanning for WiFi networks...\n");
   int n = WiFi.scanNetworks();
+  
   if (n == 0) {
     Serial.println("   No networks found!");
   } else {
@@ -661,6 +890,7 @@ void scanNetworks() {
       Serial.print(" (");
       Serial.print(WiFi.RSSI(i));
       Serial.print(" dBm) ");
+      
       // Warn about 5GHz
       if (WiFi.SSID(i).indexOf("5G") >= 0 || WiFi.SSID(i).indexOf("5g") >= 0) {
         Serial.print("⚠️ 5GHz - NOT COMPATIBLE!");
@@ -672,26 +902,32 @@ void scanNetworks() {
     Serial.println("\n   ⚠️  ESP32 only supports 2.4GHz networks!\n");
   }
 }
+
 void printSensorReadings() {
   Serial.println("\n╔═══════════════════════════════════╗");
   Serial.println("║       CURRENT SENSOR VALUES       ║");
   Serial.println("╠═══════════════════════════════════╣");
+  
   int w1 = analogRead(WATER1);
   int w2 = analogRead(WATER2);
   int w3 = analogRead(WATER3);
   int w4 = analogRead(WATER4);
   Serial.printf("║  Water: %d, %d, %d, %d\n", w1, w2, w3, w4);
   Serial.printf("║         (threshold: %d)\n", waterThreshold);
+  
   float t1 = readTemp(TEMP1);
   float t2 = readTemp(TEMP2);
   Serial.printf("║  Temp: %.1f°C, %.1f°C\n", t1, t2);
   Serial.printf("║        (threshold: %.1f°C)\n", tempThreshold);
+  
   mpu.update();
   float gyro = abs(mpu.getGyroX()) + abs(mpu.getGyroY()) + abs(mpu.getGyroZ());
   Serial.printf("║  Gyro: %.2f\n", gyro);
   Serial.printf("║        (threshold: %.2f)\n", gyroThreshold);
+  
   Serial.print("║  Gas: ");
   Serial.println((digitalRead(GAS_DO) == LOW) ? "⚠️ DETECTED" : "Normal");
+  
   if (enableVoltageSensors || enableCurrentSensors) {
     Serial.println("║  Power:");
     if (enableVoltageSensors) {
@@ -701,8 +937,10 @@ void printSensorReadings() {
       Serial.printf("║    C1=%d C2=%d\n", analogRead(CURRENT_SENSOR_1), analogRead(CURRENT_SENSOR_2));
     }
   }
+  
   Serial.println("╚═══════════════════════════════════╝\n");
 }
+
 void printFullStatus() {
   Serial.println("\n╔═══════════════════════════════════╗");
   Serial.println("║         SYSTEM STATUS             ║");
@@ -718,11 +956,34 @@ void printFullStatus() {
   Serial.println(systemEnabled ? "✅ Enabled            ║" : "❌ Disabled           ║");
   Serial.print("║  Buzzer:  ");
   Serial.println(buzzerEnabled ? "🔊 Enabled            ║" : "🔇 Muted              ║");
-  Serial.print("║  Breakers: ");
-  Serial.print(breaker1State ? "1:ON " : "1:OFF");
-  Serial.print(" ");
-  Serial.println(breaker2State ? "2:ON            ║" : "2:OFF           ║");
+  
+  // Enhanced breaker display
+  Serial.println("╠═══════════════════════════════════╣");
+  Serial.println("║      CIRCUIT BREAKER STATUS       ║");
+  Serial.println("╠═══════════════════════════════════╣");
+  
+  Serial.print("║  Breaker 1: ");
+  if (breaker1State) {
+    Serial.println("✅ ON (Circuit Closed) ║");
+  } else {
+    Serial.println("⚡ TRIPPED (Open)      ║");
+    Serial.print("║    Last trip: ");
+    Serial.print((millis() - breaker1TripTime) / 1000);
+    Serial.println("s ago        ║");
+  }
+  
+  Serial.print("║  Breaker 2: ");
+  if (breaker2State) {
+    Serial.println("✅ ON (Circuit Closed) ║");
+  } else {
+    Serial.println("⚡ TRIPPED (Open)      ║");
+    Serial.print("║    Last trip: ");
+    Serial.print((millis() - breaker2TripTime) / 1000);
+    Serial.println("s ago        ║");
+  }
+  
   unsigned long uptime = millis() / 1000;
+  Serial.println("╠═══════════════════════════════════╣");
   Serial.print("║  Uptime:  ");
   Serial.print(uptime / 3600); Serial.print("h ");
   Serial.print((uptime % 3600) / 60); Serial.print("m ");
@@ -730,6 +991,7 @@ void printFullStatus() {
   Serial.println("╠═══════════════════════════════════╣");
   Serial.println("║         ACTIVE ALERTS             ║");
   Serial.println("╠═══════════════════════════════════╣");
+  
   bool anyAlert = false;
   if (waterAlertActive) { Serial.println("║  💧 Water detected              ║"); anyAlert = true; }
   if (gasAlertActive) { Serial.println("║  💨 Gas detected                ║"); anyAlert = true; }
@@ -737,81 +999,113 @@ void printFullStatus() {
   if (gyroAlertActive) { Serial.println("║  📳 Ground movement             ║"); anyAlert = true; }
   if (powerAlertActive) { Serial.println("║  ⚡ Power abnormal              ║"); anyAlert = true; }
   if (!anyAlert) { Serial.println("║  ✅ No active alerts            ║"); }
+  
   Serial.println("╚═══════════════════════════════════╝\n");
 }
-void printHelp() {
-  Serial.println("\n╔═══════════════════════════════════╗");
-  Serial.println("║         AVAILABLE COMMANDS        ║");
-  Serial.println("╠═══════════════════════════════════╣");
-  Serial.println("║  status  - System status          ║");
-  Serial.println("║  sensors - Current sensor values  ║");
-  Serial.println("║  wifi    - WiFi information       ║");
-  Serial.println("║  scan    - Scan WiFi networks     ║");
-  Serial.println("║  shake   - Test gyro servos       ║");
-  Serial.println("║  b1on/b1off - Breaker 1 control   ║");
-  Serial.println("║  b2on/b2off - Breaker 2 control   ║");
-  Serial.println("║  tripall - Trip all breakers      ║");
-  Serial.println("║  resetall - Reset all breakers    ║");
-  Serial.println("║  help    - Show this help         ║");
-  Serial.println("╚═══════════════════════════════════╝\n");
-}
+
 // ===================================================================
 // COMMUNICATION FUNCTIONS (MQTT)
 // ===================================================================
 void sendSensorData(bool forceImmediate) {
   if (!mqttClient.connected() || !systemEnabled) return;
+  
   unsigned long currentTime = millis();
   if (!forceImmediate && (currentTime - lastDataSendTime < dataSendInterval)) {
     return;
   }
+  
   jsonDoc.clear();
+  
   JsonArray waterArray = jsonDoc.createNestedArray("water");
   waterArray.add(analogRead(WATER1));
   waterArray.add(analogRead(WATER2));
   waterArray.add(analogRead(WATER3));
   waterArray.add(analogRead(WATER4));
+  
   jsonDoc["gas"] = (digitalRead(GAS_DO) == LOW);
+  
   JsonObject tempObj = jsonDoc.createNestedObject("temperature");
   tempObj["temp1"] = readTemp(TEMP1);
   tempObj["temp2"] = readTemp(TEMP2);
+  
   JsonObject gyroObj = jsonDoc.createNestedObject("gyro");
   float gyroMovement = abs(mpu.getGyroX()) + abs(mpu.getGyroY()) + abs(mpu.getGyroZ());
   gyroObj["movement"] = gyroMovement;
   gyroObj["x"] = mpu.getGyroX();
   gyroObj["y"] = mpu.getGyroY();
   gyroObj["z"] = mpu.getGyroZ();
+  
   if (enableVoltageSensors || enableCurrentSensors) {
     JsonObject powerObj = jsonDoc.createNestedObject("power_readings");
+    
     if (enableVoltageSensors) {
       powerObj["voltage1"] = convertVoltage(analogRead(VOLTAGE_SENSOR_1));
       powerObj["voltage2"] = convertVoltage(analogRead(VOLTAGE_SENSOR_2));
     }
+    
     if (enableCurrentSensors) {
       powerObj["current1"] = convertCurrent(analogRead(CURRENT_SENSOR_1));
       powerObj["current2"] = convertCurrent(analogRead(CURRENT_SENSOR_2));
     }
   }
+  
   JsonObject breakerObj = jsonDoc.createNestedObject("breakers");
   breakerObj["breaker1"] = breaker1State;
   breakerObj["breaker2"] = breaker2State;
+  
   jsonDoc["system_enabled"] = systemEnabled;
   jsonDoc["buzzer_enabled"] = buzzerEnabled;
   jsonDoc["uptime"] = millis() / 1000;
+  
   String output;
   serializeJson(jsonDoc, output);
   publishMessage(output.c_str());
+  
   lastDataSendTime = currentTime;
 }
+
+void printHelp() {
+  Serial.println("\n╔═══════════════════════════════════════════════════════════╗");
+  Serial.println("║              AVAILABLE SERIAL COMMANDS                    ║");
+  Serial.println("╠═══════════════════════════════════════════════════════════╣");
+  Serial.println("║                                                           ║");
+  Serial.println("║  SYSTEM COMMANDS:                                         ║");
+  Serial.println("║    help       - Show this help menu                       ║");
+  Serial.println("║    status     - Display full system status                ║");
+  Serial.println("║    sensors    - Show current sensor readings              ║");
+  Serial.println("║                                                           ║");
+  Serial.println("║  WIFI COMMANDS:                                           ║");
+  Serial.println("║    wifi       - Show WiFi connection info                 ║");
+  Serial.println("║    scan       - Scan for available WiFi networks          ║");
+  Serial.println("║                                                           ║");
+  Serial.println("║  BREAKER COMMANDS:                                        ║");
+  Serial.println("║    b1on       - Turn Breaker 1 ON (reset)                 ║");
+  Serial.println("║    b1off      - Trip Breaker 1 OFF                        ║");
+  Serial.println("║    b2on       - Turn Breaker 2 ON (reset)                 ║");
+  Serial.println("║    b2off      - Trip Breaker 2 OFF                        ║");
+  Serial.println("║    tripall    - Emergency trip all breakers               ║");
+  Serial.println("║    resetall   - Reset all breakers to ON                  ║");
+  Serial.println("║                                                           ║");
+  Serial.println("║  TEST COMMANDS:                                           ║");
+  Serial.println("║    shake      - Run 30-second gyro servo shake test       ║");
+  Serial.println("║                                                           ║");
+  Serial.println("╚═══════════════════════════════════════════════════════════╝");
+  Serial.println("\n💡 TIP: Commands are case-insensitive\n");
+}
+
 void sendAlert(String alertType, String details) {
   if (!mqttClient.connected()) return;
+  
   jsonDoc.clear();
   jsonDoc["alert"] = alertType;
+  
   if (alertType == "WATER_DETECTED") {
     // Include which sensor triggered and its value
     int w1 = analogRead(WATER1);
     int w2 = analogRead(WATER2);
     int w3 = analogRead(WATER3);
     int w4 = analogRead(WATER4);
+    
     if (w1 > waterThreshold) {
       jsonDoc["sensor"] = "WATER1";
       jsonDoc["value"] = w1;
@@ -830,10 +1124,12 @@ void sendAlert(String alertType, String details) {
     jsonDoc["water2"] = w2;
     jsonDoc["water3"] = w3;
     jsonDoc["water4"] = w4;
+    
   } else if (alertType == "GAS_LEAK_DETECTED") {
     // Gas sensor is digital, but we include it for consistency
     jsonDoc["sensor"] = "GAS";
     jsonDoc["value"] = 1;  // 1 = gas detected
+    
   } else if (alertType == "HIGH_TEMPERATURE") {
     float t1 = readTemp(TEMP1);
     float t2 = readTemp(TEMP2);
@@ -845,6 +1141,7 @@ void sendAlert(String alertType, String details) {
     } else {
       jsonDoc["sensor"] = "TEMP2";
     }
+    
   } else if (alertType == "GROUND_MOVEMENT_DETECTED") {
     float intensity = abs(mpu.getGyroX()) + abs(mpu.getGyroY()) + abs(mpu.getGyroZ());
     jsonDoc["intensity"] = intensity;
@@ -853,6 +1150,7 @@ void sendAlert(String alertType, String details) {
     jsonDoc["gyro_x"] = mpu.getGyroX();
     jsonDoc["gyro_y"] = mpu.getGyroY();
     jsonDoc["gyro_z"] = mpu.getGyroZ();
+    
   } else if (alertType == "POWER_ABNORMAL") {
     jsonDoc["sensor"] = "POWER";
     if (enableVoltageSensors) {
@@ -871,20 +1169,25 @@ void sendAlert(String alertType, String details) {
         jsonDoc["value"] = max(c1, c2);
       }
     }
+    
   } else if (alertType == "MULTIPLE_HAZARDS") {
     // For multiple hazards, include a summary
     jsonDoc["sensor"] = "MULTIPLE";
     jsonDoc["value"] = details.toInt();  // Number of active hazards
   }
+  
   if (details.length() > 0) {
     jsonDoc["details"] = details;
   }
+  
   jsonDoc["timestamp"] = millis() / 1000;
   jsonDoc["threshold"] = getThresholdForAlert(alertType);
+  
   String output;
   serializeJson(jsonDoc, output);
   publishMessage(output.c_str());
 }
+
 // Helper function to get the threshold for each alert type
 float getThresholdForAlert(String alertType) {
   if (alertType == "WATER_DETECTED") return waterThreshold;
@@ -893,12 +1196,15 @@ float getThresholdForAlert(String alertType) {
   if (alertType == "POWER_ABNORMAL") return voltageThreshold;
   return 0;
 }
+
 void sendAlertCleared(String alertType) {
   if (!mqttClient.connected()) return;
+  
   jsonDoc.clear();
   jsonDoc["status"] = "ALERT_CLEARED";
   jsonDoc["type"] = alertType;
   jsonDoc["timestamp"] = millis() / 1000;
+  
   String output;
   serializeJson(jsonDoc, output);
   publishMessage(output.c_str());
@@ -912,8 +1218,6 @@ void sendSystemStatus() {
   jsonDoc["device_id"] = deviceId;
   jsonDoc["system_enabled"] = systemEnabled;
   jsonDoc["buzzer_enabled"] = buzzerEnabled;
-  jsonDoc["timestamp"] = millis() / 1000;
-  jsonDoc["type"] = "status_update";
   
   JsonObject thresh = jsonDoc.createNestedObject("thresholds");
   thresh["water"] = waterThreshold;
@@ -930,137 +1234,26 @@ void sendSystemStatus() {
   breakers["breaker1"] = breaker1State;
   breakers["breaker2"] = breaker2State;
   
-  JsonObject alerts = jsonDoc.createNestedObject("active_alerts");
-  alerts["water"] = waterAlertActive;
-  alerts["gas"] = gasAlertActive;
-  alerts["temperature"] = tempAlertActive;
-  alerts["movement"] = gyroAlertActive;
-  alerts["power"] = powerAlertActive;
-  
   jsonDoc["uptime"] = millis() / 1000;
-  jsonDoc["firmware_version"] = "3.2-MQTT-Enhanced";
+  jsonDoc["firmware_version"] = "3.1-MQTT-AlertOnly";
   
   String output;
   serializeJson(jsonDoc, output);
   publishMessage(output.c_str());
-  
-  Serial.println("📊 System status sent");
 }
-
-// ===================================================================
-// NEW: DIAGNOSTIC REPORT FUNCTION
-// ===================================================================
-void sendDiagnosticReport() {
-  if (!mqttClient.connected()) {
-    Serial.println("⚠️  Cannot send diagnostics: MQTT not connected");
-    return;
-  }
-  
-  jsonDoc.clear();
-  jsonDoc["message_type"] = "DIAGNOSTICS";
-  jsonDoc["device_id"] = deviceId;
-  
-  // System info
-  JsonObject sysInfo = jsonDoc.createNestedObject("system");
-  sysInfo["uptime_seconds"] = millis() / 1000;
-  sysInfo["free_heap"] = ESP.getFreeHeap();
-  sysInfo["chip_model"] = ESP.getChipModel();
-  sysInfo["chip_cores"] = ESP.getChipCores();
-  sysInfo["cpu_freq_mhz"] = ESP.getCpuFreqMHz();
-  
-  // WiFi info
-  JsonObject wifiInfo = jsonDoc.createNestedObject("wifi");
-  wifiInfo["connected"] = (WiFi.status() == WL_CONNECTED);
-  wifiInfo["ssid"] = WiFi.SSID();
-  wifiInfo["rssi"] = WiFi.RSSI();
-  wifiInfo["ip"] = WiFi.localIP().toString();
-  wifiInfo["mac"] = WiFi.macAddress();
-  
-  // MQTT info
-  JsonObject mqttInfo = jsonDoc.createNestedObject("mqtt");
-  mqttInfo["connected"] = mqttClient.connected();
-  mqttInfo["broker"] = mqtt_broker;
-  
-  // Current sensor readings
-  JsonObject sensors = jsonDoc.createNestedObject("sensors");
-  
-  JsonArray water = sensors.createNestedArray("water");
-  water.add(analogRead(WATER1));
-  water.add(analogRead(WATER2));
-  water.add(analogRead(WATER3));
-  water.add(analogRead(WATER4));
-  
-  sensors["gas"] = (digitalRead(GAS_DO) == LOW);
-  sensors["temp1"] = readTemp(TEMP1);
-  sensors["temp2"] = readTemp(TEMP2);
-  
-  mpu.update();
-  sensors["gyro_movement"] = abs(mpu.getGyroX()) + abs(mpu.getGyroY()) + abs(mpu.getGyroZ());
-  
-  // System state
-  JsonObject state = jsonDoc.createNestedObject("state");
-  state["system_enabled"] = systemEnabled;
-  state["buzzer_enabled"] = buzzerEnabled;
-  state["breaker1"] = breaker1State;
-  state["breaker2"] = breaker2State;
-  state["water_alert"] = waterAlertActive;
-  state["gas_alert"] = gasAlertActive;
-  state["temp_alert"] = tempAlertActive;
-  state["gyro_alert"] = gyroAlertActive;
-  state["power_alert"] = powerAlertActive;
-  
-  jsonDoc["timestamp"] = millis() / 1000;
-  
-  String output;
-  serializeJson(jsonDoc, output);
-  publishMessage(output.c_str());
-  
-  Serial.println("✅ Diagnostic report sent");
-}
-
 
 void sendAckResponse(String message) {
-  if (!mqttClient.connected()) {
-    Serial.println("⚠️  Cannot send ACK: MQTT not connected");
-    return;
-  }
+  if (!mqttClient.connected()) return;
   
   jsonDoc.clear();
   jsonDoc["status"] = "OK";
   jsonDoc["message"] = message;
   jsonDoc["device_id"] = deviceId;
-  jsonDoc["timestamp"] = millis() / 1000;
-  jsonDoc["type"] = "acknowledgment";
   
   String output;
   serializeJson(jsonDoc, output);
   publishMessage(output.c_str());
-  
-  Serial.print("📤 ACK sent: ");
-  Serial.println(message);
 }
-
-void sendErrorResponse(String error) {
-  if (!mqttClient.connected()) {
-    Serial.println("⚠️  Cannot send ERROR: MQTT not connected");
-    return;
-  }
-  
-  jsonDoc.clear();
-  jsonDoc["status"] = "ERROR";
-  jsonDoc["error"] = error;
-  jsonDoc["device_id"] = deviceId;
-  jsonDoc["timestamp"] = millis() / 1000;
-  jsonDoc["type"] = "error";
-  
-  String output;
-  serializeJson(jsonDoc, output);
-  publishMessage(output.c_str());
-  
-  Serial.print("❌ ERROR sent: ");
-  Serial.println(error);
-}
-
 
 // ===================================================================
 // SETUP
@@ -1068,31 +1261,40 @@ void sendErrorResponse(String error) {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
   pinMode(GAS_DO, INPUT);
   pinMode(BUZZER, OUTPUT);
+  
   initServos();
+
   Wire.begin(21, 22);
   mpu.begin();
   Serial.println("Calibrating gyro...");
   mpu.calcGyroOffsets(true);
+
   Serial.println("\n╔═══════════════════════════════════╗");
   Serial.println("║  ESP32 SAFETY MONITORING SYSTEM   ║");
   Serial.println("║     Version 3.1 (Alert-Only)      ║");
   Serial.println("╚═══════════════════════════════════╝\n");
+  
   // ==================== WIFI SETUP ====================
   Serial.print("🌐 Connecting to: ");
   Serial.println(ssid);
+  
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(1000);
   WiFi.begin(ssid, password);
+  
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
     Serial.print(".");
     attempts++;
   }
+  
   Serial.println();
+  
   if (WiFi.status() == WL_CONNECTED) {
     prevWifiConnected = true;
     Serial.println("\n╔═══════════════════════════════════╗");
@@ -1105,10 +1307,12 @@ void setup() {
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm               ║");
     Serial.println("╚═══════════════════════════════════╝\n");
+    
     // Generate Device ID from MAC address
     deviceId = getDeviceId();
     telemetryTopic = "apn/device/" + deviceId + "/telemetry";
     commandTopic = "apn/device/" + deviceId + "/commands";
+    
     Serial.println("📱 Device Configuration:");
     Serial.print("   Device ID: ");
     Serial.println(deviceId);
@@ -1117,36 +1321,45 @@ void setup() {
     Serial.print("   Command Topic: ");
     Serial.println(commandTopic);
     Serial.println();
+    
     // Setup MQTT with TLS
     espClient.setCACert(root_ca);
     mqttClient.setServer(mqtt_broker, mqtt_port);
     mqttClient.setCallback(mqttCallback);
     mqttClient.setBufferSize(1024);  // Increase buffer for larger messages
+    
     // Connect to MQTT
     mqttReconnect();
+    
   } else {
     Serial.println("\n❌ WiFi FAILED - Check SSID/password");
     Serial.println("   ⚠️  Remember: ESP32 only works with 2.4GHz WiFi!");
     Serial.println("   Type 'scan' to see available networks\n");
   }
+  
   Serial.println("✅ System Ready - Type 'help' for commands");
   Serial.println("─────────────────────────────────────────\n");
+  
   // Initialize previous states
   prevBreaker1State = breaker1State;
   prevBreaker2State = breaker2State;
   prevSystemEnabled = systemEnabled;
   prevBuzzerEnabled = buzzerEnabled;
+  
   // Startup beep
   digitalWrite(BUZZER, HIGH);
   delay(200);
   digitalWrite(BUZZER, LOW);
+  
   lastHeartbeat = millis();
 }
+
 // ===================================================================
 // MAIN LOOP
 // ===================================================================
 void loop() {
   unsigned long currentTime = millis();
+
   // Handle MQTT
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
@@ -1161,10 +1374,13 @@ void loop() {
       mqttClient.loop();
     }
   }
+  
   // ==================== WIFI STATUS CHECK ====================
   if (currentTime - lastWiFiCheck > 10000) {
     lastWiFiCheck = currentTime;
+    
     bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+    
     // Only print on WiFi state change
     if (wifiConnected != prevWifiConnected) {
       if (wifiConnected) {
@@ -1178,12 +1394,14 @@ void loop() {
         Serial.print(WiFi.RSSI());
         Serial.println(" dBm               ║");
         Serial.println("╚═══════════════════════════════════╝\n");
+        
         wifiConnecting = false;
       } else {
         Serial.println("\n⚠️  WiFi DISCONNECTED!\n");
       }
       prevWifiConnected = wifiConnected;
     }
+    
     // Try to reconnect if disconnected
     if (!wifiConnected && !wifiConnecting) {
       wifiConnecting = true;
@@ -1192,6 +1410,7 @@ void loop() {
       WiFi.begin(ssid, password);
     }
   }
+  
   // ==================== MQTT CONNECTION CHANGE ====================
   bool currentMqttConnected = mqttClient.connected();
   if (currentMqttConnected != prevMqttConnected) {
@@ -1202,37 +1421,80 @@ void loop() {
     }
     prevMqttConnected = currentMqttConnected;
   }
-  // ==================== SERIAL COMMANDS ====================
-  if (Serial.available() > 0) {
-    String command = Serial.readStringUntil('\n');
-    command.trim();
-    command.toLowerCase();
-    if (command == "shake") {
-      testGyroShake();
-    } else if (command == "b1on") {
-      setBreakerState(1, false);
-    } else if (command == "b1off") {
-      setBreakerState(1, true);
-    } else if (command == "b2on") {
-      setBreakerState(2, false);
-    } else if (command == "b2off") {
-      setBreakerState(2, true);
-    } else if (command == "tripall") {
-      tripAllBreakers();
-    } else if (command == "resetall") {
-      resetAllBreakers();
-    } else if (command == "status") {
-      printFullStatus();
-    } else if (command == "wifi") {
-      printWiFiInfo();
-    } else if (command == "scan") {
-      scanNetworks();
-    } else if (command == "sensors") {
-      printSensorReadings();
-    } else if (command == "help") {
-      printHelp();
+
+// ==================== SERIAL COMMANDS ====================
+if (Serial.available() > 0) {
+  String command = Serial.readStringUntil('\n');
+  command.trim();
+  command.toLowerCase();
+  
+  if (command == "shake") {
+    testGyroShake();
+  } else if (command == "b1on") {
+    Serial.println("Manual: Breaker 1 ON");
+    breaker1State = true;
+    if (!breakerServo1.attached()) breakerServo1.attach(BREAKER_SERVO_1);
+    breakerServo1.write(breakerOnAngle);
+    
+  } else if (command == "b1off") {
+    Serial.println("Manual: Breaker 1 OFF");
+    breaker1State = false;
+    if (!breakerServo1.attached()) breakerServo1.attach(BREAKER_SERVO_1);
+    breakerServo1.write(breakerOnAngle);
+    delay(100);
+    for (int pos = breakerOnAngle; pos >= breakerOffAngle; pos -= 5) {
+      breakerServo1.write(pos);
+      delay(10);
     }
+    breakerServo1.write(breakerOffAngle);
+    delay(500);
+    for (int pos = breakerOffAngle; pos <= breakerOnAngle; pos += 3) {
+      breakerServo1.write(pos);
+      delay(15);
+    }
+    breakerServo1.write(breakerOnAngle);
+    
+  } else if (command == "b2on") {
+    Serial.println("Manual: Breaker 2 ON");
+    breaker2State = true;
+    if (!breakerServo2.attached()) breakerServo2.attach(BREAKER_SERVO_2);
+    breakerServo2.write(breakerOnAngle);
+    
+  } else if (command == "b2off") {
+    Serial.println("Manual: Breaker 2 OFF");
+    breaker2State = false;
+    if (!breakerServo2.attached()) breakerServo2.attach(BREAKER_SERVO_2);
+    breakerServo2.write(breakerOnAngle);
+    delay(100);
+    for (int pos = breakerOnAngle; pos >= breakerOffAngle; pos -= 5) {
+      breakerServo2.write(pos);
+      delay(10);
+    }
+    breakerServo2.write(breakerOffAngle);
+    delay(500);
+    for (int pos = breakerOffAngle; pos <= breakerOnAngle; pos += 3) {
+      breakerServo2.write(pos);
+      delay(15);
+    }
+    breakerServo2.write(breakerOnAngle);
+    
+  } else if (command == "tripall") {
+    tripAllBreakers();
+  } else if (command == "resetall") {
+    resetAllBreakers();
+  } else if (command == "status") {
+    printFullStatus();
+  } else if (command == "wifi") {
+    printWiFiInfo();
+  } else if (command == "scan") {
+    scanNetworks();
+  } else if (command == "sensors") {
+    printSensorReadings();
+  } else if (command == "help") {
+    printHelp();
   }
+}
+
   // Only run monitoring if system is enabled
   if (!systemEnabled) {
     if (prevSystemEnabled) {
@@ -1245,46 +1507,60 @@ void loop() {
     Serial.println("▶️  System ENABLED");
     prevSystemEnabled = true;
   }
+
   // ==================== READ SENSORS ====================
   int w1 = analogRead(WATER1);
   int w2 = analogRead(WATER2);
   int w3 = analogRead(WATER3);
   int w4 = analogRead(WATER4);
+
   bool waterDetected = (w1 > waterThreshold) || (w2 > waterThreshold) ||
                        (w3 > waterThreshold) || (w4 > waterThreshold);
+
   bool gasDetected = (digitalRead(GAS_DO) == LOW);
+
   float t1 = readTemp(TEMP1);
   float t2 = readTemp(TEMP2);
   float maxTemp = max(t1, t2);
+
   bool tempCritical = (t1 >= tempThreshold || t2 >= tempThreshold);
   bool tempWarning = (maxTemp >= tempWarningLevel && maxTemp < tempThreshold);
+
   mpu.update();
   float gyroMovement = abs(mpu.getGyroX()) + abs(mpu.getGyroY()) + abs(mpu.getGyroZ());
   bool gyroDetected = gyroMovement > gyroThreshold;
+
   int v1 = analogRead(VOLTAGE_SENSOR_1);
   int v2 = analogRead(VOLTAGE_SENSOR_2);
   int c1 = analogRead(CURRENT_SENSOR_1);
   int c2 = analogRead(CURRENT_SENSOR_2);
+
   bool powerCritical = false;
   bool powerWarning = false;
+  
   if (enableVoltageSensors || enableCurrentSensors) {
     powerCritical =
       (enableVoltageSensors && (v1 > voltageThreshold || v2 > voltageThreshold)) ||
       (enableCurrentSensors && (c1 > currentThreshold || c2 > currentThreshold));
+      
     powerWarning =
       (enableVoltageSensors && ((v1 > voltageWarning && v1 <= voltageThreshold) ||
                                 (v2 > voltageWarning && v2 <= voltageThreshold))) ||
       (enableCurrentSensors && ((c1 > currentWarning && c1 <= currentThreshold) ||
                                 (c2 > currentWarning && c2 <= currentThreshold)));
   }
+
   int hazardCount = 0;
   if (waterDetected) hazardCount++;
   if (gasDetected) hazardCount++;
   if (tempCritical) hazardCount++;
   if (gyroDetected) hazardCount++;
   if (powerCritical) hazardCount++;
+
   bool multipleHazards = hazardCount >= 2;
+
   // ==================== PRINT ONLY ON STATE CHANGES ====================
+  
   // Water state change
   if (waterDetected != prevWaterDetected) {
     if (waterDetected) {
@@ -1296,6 +1572,7 @@ void loop() {
     }
     prevWaterDetected = waterDetected;
   }
+  
   // Gas state change
   if (gasDetected != prevGasDetected) {
     if (gasDetected) {
@@ -1305,6 +1582,7 @@ void loop() {
     }
     prevGasDetected = gasDetected;
   }
+  
   // Temperature critical state change
   if (tempCritical != prevTempCritical) {
     if (tempCritical) {
@@ -1316,6 +1594,7 @@ void loop() {
     }
     prevTempCritical = tempCritical;
   }
+  
   // Temperature warning state change
   if (!tempCritical && tempWarning != prevTempWarning) {
     if (tempWarning) {
@@ -1323,6 +1602,7 @@ void loop() {
     }
     prevTempWarning = tempWarning;
   }
+  
   // Gyro state change
   if (gyroDetected != prevGyroDetected) {
     if (gyroDetected) {
@@ -1334,6 +1614,7 @@ void loop() {
     }
     prevGyroDetected = gyroDetected;
   }
+  
   // Power critical state change
   if (powerCritical != prevPowerCritical) {
     if (powerCritical) {
@@ -1350,6 +1631,7 @@ void loop() {
     }
     prevPowerCritical = powerCritical;
   }
+  
   // Power warning state change
   if (!powerCritical && powerWarning != prevPowerWarning) {
     if (powerWarning) {
@@ -1357,6 +1639,7 @@ void loop() {
     }
     prevPowerWarning = powerWarning;
   }
+  
   // Breaker state changes
   if (breaker1State != prevBreaker1State) {
     Serial.printf("⚡ Breaker 1: %s\n", breaker1State ? "ON" : "OFF (TRIPPED)");
@@ -1366,15 +1649,18 @@ void loop() {
     Serial.printf("⚡ Breaker 2: %s\n", breaker2State ? "ON" : "OFF (TRIPPED)");
     prevBreaker2State = breaker2State;
   }
+  
   // Buzzer state change
   if (buzzerEnabled != prevBuzzerEnabled) {
     Serial.printf("🔊 Buzzer: %s\n", buzzerEnabled ? "ENABLED" : "MUTED");
     prevBuzzerEnabled = buzzerEnabled;
   }
+  
   // Multiple hazards warning
   if (multipleHazards) {
     Serial.printf("🚨🚨 CRITICAL: %d HAZARDS ACTIVE! 🚨🚨\n", hazardCount);
   }
+
   // ==================== HEARTBEAT ====================
   if (heartbeatInterval > 0 && (currentTime - lastHeartbeat >= heartbeatInterval)) {
     if (!waterDetected && !gasDetected && !tempCritical && !gyroDetected && !powerCritical) {
@@ -1385,81 +1671,105 @@ void loop() {
     }
     lastHeartbeat = currentTime;
   }
-  // ==================== ALERT HANDLING ====================
-  if (multipleHazards) {
-    buzzCritical();
+
+// ==================== ALERT HANDLING ====================
+bool anyActiveAlert = waterDetected || gasDetected || tempCritical || powerCritical;
+
+if (multipleHazards) {
+  buzzCritical();
+  if (!breakersTrippedByAlert && (breaker1State || breaker2State)) {
     tripAllBreakers();
-    if (currentTime - lastAlertTime > alertCooldown) {
-      sendAlert("MULTIPLE_HAZARDS", String(hazardCount) + " active");
-      lastAlertTime = currentTime;
-    }
+    breakersTrippedByAlert = true;
   }
-  else if (waterDetected) {
-    buzzWater();
+  if (currentTime - lastAlertTime > alertCooldown) {
+    sendAlert("MULTIPLE_HAZARDS", String(hazardCount) + " active");
+    lastAlertTime = currentTime;
+  }
+}
+else if (waterDetected) {
+  buzzWater();
+  if (!breakersTrippedByAlert && (breaker1State || breaker2State)) {
     tripAllBreakers();
-    if (!waterAlertActive) {
-      sendAlert("WATER_DETECTED");
-      waterAlertActive = true;
-    }
-  } 
-  else if (gasDetected) {
-    buzzGas();
+    breakersTrippedByAlert = true;
+  }
+  if (!waterAlertActive) {
+    sendAlert("WATER_DETECTED");
+    waterAlertActive = true;
+  }
+} 
+else if (gasDetected) {
+  buzzGas();
+  if (!breakersTrippedByAlert && (breaker1State || breaker2State)) {
     tripAllBreakers();
-    if (!gasAlertActive) {
-      sendAlert("GAS_LEAK_DETECTED");
-      gasAlertActive = true;
-    }
+    breakersTrippedByAlert = true;
   }
-  else if (tempCritical) {
-    buzzTemp();
+  if (!gasAlertActive) {
+    sendAlert("GAS_LEAK_DETECTED");
+    gasAlertActive = true;
+  }
+}
+else if (tempCritical) {
+  buzzTemp();
+  if (!breakersTrippedByAlert && (breaker1State || breaker2State)) {
     tripAllBreakers();
-    if (!tempAlertActive) {
-      sendAlert("HIGH_TEMPERATURE");
-      tempAlertActive = true;
-    }
+    breakersTrippedByAlert = true;
   }
-  else if (gyroDetected) {
-    buzzGyro();
-    if (!gyroAlertActive) {
-      sendAlert("GROUND_MOVEMENT_DETECTED");
-      gyroAlertActive = true;
-    }
+  if (!tempAlertActive) {
+    sendAlert("HIGH_TEMPERATURE");
+    tempAlertActive = true;
   }
-  else if (powerCritical) {
-    buzzPower();
+}
+else if (gyroDetected) {
+  buzzGyro();
+  // Gyro alerts but doesn't trip breakers
+  if (!gyroAlertActive) {
+    sendAlert("GROUND_MOVEMENT_DETECTED");
+    gyroAlertActive = true;
+  }
+}
+else if (powerCritical) {
+  buzzPower();
+  if (!breakersTrippedByAlert && (breaker1State || breaker2State)) {
     tripAllBreakers();
-    if (!powerAlertActive) {
-      sendAlert("POWER_ABNORMAL");
-      powerAlertActive = true;
-    }
+    breakersTrippedByAlert = true;
   }
-  else if (tempWarning || powerWarning) {
-    buzzWarning();
+  if (!powerAlertActive) {
+    sendAlert("POWER_ABNORMAL");
+    powerAlertActive = true;
   }
-  else {
-    // All clear - send cleared alerts
-    if (waterAlertActive) {
-      sendAlertCleared("WATER");
-      waterAlertActive = false;
-    }
-    if (gasAlertActive) {
-      sendAlertCleared("GAS");
-      gasAlertActive = false;
-    }
-    if (tempAlertActive) {
-      sendAlertCleared("TEMPERATURE");
-      tempAlertActive = false;
-    }
-    if (gyroAlertActive) {
-      sendAlertCleared("MOVEMENT");
-      gyroAlertActive = false;
-    }
-    if (powerAlertActive) {
-      sendAlertCleared("POWER");
-      powerAlertActive = false;
-    }
-    digitalWrite(BUZZER, LOW);
+}
+else if (tempWarning || powerWarning) {
+  buzzWarning();
+}
+else {
+  // All clear - reset the trip flag
+  breakersTrippedByAlert = false;
+  
+  // Send cleared alerts
+  if (waterAlertActive) {
+    sendAlertCleared("WATER");
+    waterAlertActive = false;
   }
+  if (gasAlertActive) {
+    sendAlertCleared("GAS");
+    gasAlertActive = false;
+  }
+  if (tempAlertActive) {
+    sendAlertCleared("TEMPERATURE");
+    tempAlertActive = false;
+  }
+  if (gyroAlertActive) {
+    sendAlertCleared("MOVEMENT");
+    gyroAlertActive = false;
+  }
+  if (powerAlertActive) {
+    sendAlertCleared("POWER");
+    powerAlertActive = false;
+  }
+  
+  digitalWrite(BUZZER, LOW);
+}
+
   // Optional: Send periodic sensor data (only if enabled, default is OFF)
   // This is useful for confirming device is alive, but set to 5 minute intervals
   if (enablePeriodicUpdates && periodicUpdateInterval > 0) {
@@ -1468,5 +1778,6 @@ void loop() {
       lastPeriodicUpdate = currentTime;
     }
   }
+
   delay(100);
 }
