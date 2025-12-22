@@ -1,0 +1,9 @@
+*.exe
+*.bin
+*.elf
+*.hex
+*.map
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
