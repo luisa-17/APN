@@ -1,4 +1,3 @@
-
 #include <Wire.h>
 #include <MPU6050_tockn.h>
 #include <ESP32Servo.h>
@@ -84,45 +83,50 @@ String commandTopic;
 #define BREAKER_SERVO_1 18
 #define BREAKER_SERVO_2 23
 
-// ==================== YOUR CALIBRATION VALUES ====================
-// --- CURRENT SENSOR (ACS712T-5A) ---
-const float DIVIDER_RATIO     = 0.595;   // 100k / (68k + 100k)
-const float ADC_REF_VOLTAGE   = 3.2;     // Your ESP32 actual 3.3V rail
-const float SENSITIVITY       = 0.185;   // 185mV/A for 5A version
+// ==================== POWER CALIBRATION & STATE ====================
 
-// --- VOLTAGE SENSOR ---
-const float inputMaxVoltage   = 25.0;
-const float calibrationFactor = 1.15;
+// ADC settings (from your test code)
+const float ADC_REF_VOLTAGE = 3.3f;   // ADC_REF
+const int   ADC_MAX         = 4095;   // 12-bit ADC
 
-// --- NOISE FILTER THRESHOLD ---
-const int VOLTAGE_NOISE_THRESHOLD = 50;
-const int VOLTAGE_SAMPLES = 100;
+// Voltage sensor settings
+const float inputMaxVoltage   = 25.0f;  // INPUT_MAX_VOLTAGE
+const float calibrationFactor = 0.59f;  // VOLT_CAL (tune this to match your multimeter)
 
-// ==================== THRESHOLDS ====================
-float voltageThreshold  = 16.0;
-float currentThreshold  = 2.0;
-float tempThreshold     = 50.0;
-float gyroThreshold = 5.0;      
-float tempWarningLevel  = 40.0;
-float voltageWarning    = 14.5;
-float currentWarning    = 1.5;
+// ACS712-5A current sensor settings (with 68k + 100k divider)
+const float DIVIDER_RATIO = 0.595f;     // 68k / (68k + 100k)
+const float SENSITIVITY   = 0.18f;      // ACS_SENS (tuned)
 
-// ==================== ENABLE FLAGS ====================
-bool enableVoltageSensors = true;
-bool enableCurrentSensors = true;
+// Noise thresholds
+const float CURRENT_NOISE_THRESHOLD = 0.20f;   // 0.20 A
+const int   VOLTAGE_NOISE_THRESHOLD = 50;     // raw ADC below this -> treated as 0V in debug only
 
-// ==================== POWER READINGS ====================
-float zeroPoint1 = 0.0;
-float zeroPoint2 = 0.0;
-float voltage1_V = 0.0;
-float voltage2_V = 0.0;
-float current1_A = 0.0;
-float current2_A = 0.0;
+// Runtime power state
+float zeroPoint1 = 0.0f;   // ACS zero point for CURRENT_SENSOR_1
+float zeroPoint2 = 0.0f;   // ACS zero point for CURRENT_SENSOR_2
+
+float voltage1_V = 0.0f;
+float voltage2_V = 0.0f;
+float current1_A = 0.0f;
+float current2_A = 0.0f;
+
 int voltage1_raw = 0;
 int voltage2_raw = 0;
 
 unsigned long lastPowerUpdate = 0;
 const unsigned long powerUpdateInterval = 500;
+
+// ==================== THRESHOLDS & FLAGS ====================
+float voltageThreshold  = 16.0f;
+float currentThreshold  = 2.0f;
+float tempThreshold     = 0.0f;
+float gyroThreshold     = 5.0f;
+float tempWarningLevel  = 40.0f;
+float voltageWarning    = 14.5f;
+float currentWarning    = 1.5f;
+
+bool enableVoltageSensors = true;   // set to false if sensors not wired
+bool enableCurrentSensors = true;   // set to false if sensors not wired
 
 // ==================== SERVO CONFIGURATION ====================
 Servo servoGyro1;
@@ -192,7 +196,7 @@ StaticJsonDocument<512> jsonReceive;
 // ==================== FORWARD DECLARATIONS ====================
 void sendAlert(String alertType, String details = "");
 void sendAlertCleared(String alertType);
-void sendSensorData(bool forceImmediate);
+void sendSensorData(bool forceImmediate = false);
 void sendSystemStatus();
 void sendBreakerStatus();
 void sendAckResponse(String message);
@@ -236,13 +240,9 @@ String getDeviceId();
 // ==================== SYNC TIME (Required for TLS) ====================
 void syncTime() {
   Serial.println("🕐 Syncing time with NTP...");
-  
-  // GMT+8 for Philippines - change if you're in different timezone
   configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
-  
   int retry = 0;
   time_t now = time(nullptr);
-  
   while (now < 100000 && retry < 30) {
     delay(500);
     Serial.print(".");
@@ -250,7 +250,6 @@ void syncTime() {
     now = time(nullptr);
   }
   Serial.println();
-  
   if (now > 100000) {
     timeIsSynced = true;
     struct tm timeinfo;
@@ -265,9 +264,8 @@ void syncTime() {
 
 // ==================== DEVICE ID GENERATION (FIXED) ====================
 String getDeviceId() {
-  // Use the String version which is more reliable
   String mac = WiFi.macAddress();
-  mac.replace(":", "");  // Remove colons: AA:BB:CC:DD:EE:FF -> AABBCCDDEEFF
+  mac.replace(":", "");
   Serial.print("   Raw MAC: ");
   Serial.println(WiFi.macAddress());
   Serial.print("   Device ID: ");
@@ -291,69 +289,94 @@ void configureADC() {
   analogSetAttenuation(ADC_11db);
 }
 
-// ==================== CURRENT SENSOR CALIBRATION ====================
+// ==================== CURRENT SENSOR ZERO CALIBRATION ====================
 float calibrateZero(int pin) {
-  Serial.print("   Calibrating pin ");
+  const int N = 2000;
+  long sum_mV = 0;  // sum in mV for precision
+
+  Serial.print("   Calibrating ACS712 zero on pin ");
   Serial.print(pin);
   Serial.println(" (2000 samples)...");
-  
-  long sum = 0;
-  for (int i = 0; i < 2000; i++) {
-    sum += analogRead(pin);
-    if ((i % 200) == 0) yield();
+
+  for (int i = 0; i < N; i++) {
+    int rawI = analogRead(pin);
+
+    // Voltage at ESP32 pin from divider
+    float vAdc = (rawI * ADC_REF_VOLTAGE) / ADC_MAX;  // V at GPIO
+
+    // Undo the 68k/100k divider to get actual ACS712 output
+    float vSensor = vAdc / DIVIDER_RATIO;             // V at ACS OUT pin
+
+    sum_mV += (long)(vSensor * 1000.0f);              // accumulate in mV
     delay(2);
   }
-  
-  float avgADC = sum / 2000.0;
-  float voltageESP = (avgADC * ADC_REF_VOLTAGE) / 4095.0;
-  float sensorVoltage = voltageESP / DIVIDER_RATIO;
-  
-  Serial.print("   Zero point: ");
-  Serial.print(sensorVoltage, 4);
-  Serial.println(" V");
-  
-  return sensorVoltage;
+
+  float zero = (sum_mV / (float)N) / 1000.0f;         // back to volts
+
+  Serial.print(F("   Calibrated ACS zero point: "));
+  Serial.print(zero, 3);
+  Serial.println(F(" V"));
+  Serial.println(F("   --------------------------------"));
+
+  return zero;
 }
 
-// ==================== VOLTAGE READING ====================
+// ==================== VOLTAGE READING (MATCHES TEST CODE) ====================
 float readVoltage(int pin, int* rawOut) {
+  const int NS = 100;
   long sum = 0;
-  for (int i = 0; i < VOLTAGE_SAMPLES; i++) {
+
+  for (int i = 0; i < NS; i++) {
     sum += analogRead(pin);
     delayMicroseconds(100);
   }
-  int raw = sum / VOLTAGE_SAMPLES;
-  
-  if (rawOut != NULL) {
-    *rawOut = raw;
+
+  float rawAvg = sum / (float)NS;
+
+  if (rawOut != nullptr) {
+    *rawOut = (int)rawAvg;
   }
-  
-  if (raw < VOLTAGE_NOISE_THRESHOLD) {
-    return 0.0;
+
+  // Map ADC reading to input voltage range
+  float voltage = (rawAvg / ADC_MAX) * inputMaxVoltage;
+  voltage *= calibrationFactor;  // apply correction
+
+  // Hide the ~2–3V ghost reading when nothing is connected
+  if (voltage < 3.0f) {
+    voltage = 0.0f;
   }
-  
-  float voltage = (raw / 4095.0) * inputMaxVoltage;
-  voltage *= calibrationFactor;
+
   return voltage;
 }
 
-// ==================== CURRENT READING ====================
+// ==================== CURRENT READING (MATCHES TEST CODE) ====================
 float readCurrent(int pin, float zeroPoint) {
+  const int NS = 500;
   long sum = 0;
-  for (int i = 0; i < 1000; i++) {
+
+  for (int i = 0; i < NS; i++) {
     sum += analogRead(pin);
-    if ((i % 200) == 0) yield();
     delayMicroseconds(80);
   }
-  
-  float avgADC = sum / 1000.0;
-  float voltageESP = (avgADC * ADC_REF_VOLTAGE) / 4095.0;
-  float sensorVoltage = voltageESP / DIVIDER_RATIO;
-  
-  float current = (sensorVoltage - zeroPoint) / SENSITIVITY;
-  current = abs(current);
-  
-  if (current < 0.03) current = 0.0;
+
+  float rawAvg = sum / (float)NS;
+
+  // Voltage at ESP32 pin (after divider)
+  float vAdc = (rawAvg * ADC_REF_VOLTAGE) / ADC_MAX;  // V at GPIO
+
+  // Undo divider to get actual ACS712 output voltage
+  float vSensor = vAdc / DIVIDER_RATIO;               // V at ACS OUT
+
+  // Your ACS output goes DOWN with current:
+  float current = (zeroPoint - vSensor) / SENSITIVITY;  // A
+
+  current = fabs(current);  // always positive
+
+  // Noise filter
+  if (current < CURRENT_NOISE_THRESHOLD) {
+    current = 0.0f;
+  }
+
   return current;
 }
 
@@ -668,8 +691,8 @@ void handleAlerts() {
   bool zone2Water = checkZone2Water();
   bool zone1Power = checkZone1Power();
   bool zone2Power = checkZone2Power();
-  bool zone1Temp = checkZone1Temp();
-  bool zone2Temp = checkZone2Temp();
+  bool zone1Temp  = checkZone1Temp();
+  bool zone2Temp  = checkZone2Temp();
   
   bool zone1Hazard = zone1Water || zone1Power || zone1Temp;
   bool zone2Hazard = zone2Water || zone2Power || zone2Temp;
@@ -866,9 +889,9 @@ void handleIncomingCommand() {
   else if (jsonReceive.containsKey("set_thresholds")) {
     JsonObject thresholds = jsonReceive["set_thresholds"];
     if (thresholds.containsKey("temperature")) tempThreshold = thresholds["temperature"];
-    if (thresholds.containsKey("gyro")) gyroThreshold = thresholds["gyro"];
-    if (thresholds.containsKey("voltage")) voltageThreshold = thresholds["voltage"];
-    if (thresholds.containsKey("current")) currentThreshold = thresholds["current"];
+    if (thresholds.containsKey("gyro"))        gyroThreshold = thresholds["gyro"];
+    if (thresholds.containsKey("voltage"))     voltageThreshold = thresholds["voltage"];
+    if (thresholds.containsKey("current"))     currentThreshold = thresholds["current"];
     sendAckResponse("Thresholds updated");
     sendSystemStatus();
   }
@@ -881,7 +904,6 @@ bool mqttReconnect() {
     return false;
   }
   
-  // Check if time is synced (required for TLS)
   if (!timeIsSynced) {
     Serial.println("⚠️ Time not synced - retrying NTP...");
     syncTime();
@@ -891,18 +913,16 @@ bool mqttReconnect() {
     }
   }
   
-  // Make sure device ID is set
   if (deviceId.length() == 0) {
     deviceId = getDeviceId();
     telemetryTopic = "apn/device/" + deviceId + "/telemetry";
-    commandTopic = "apn/device/" + deviceId + "/commands";
+    commandTopic   = "apn/device/" + deviceId + "/commands";
   }
   
   String clientId = "ESP32-" + deviceId;
   Serial.print("📡 MQTT: Connecting as ");
   Serial.println(clientId);
   
-  // Set socket timeout
   mqttClient.setSocketTimeout(10);
   
   if (mqttClient.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
@@ -917,7 +937,6 @@ bool mqttReconnect() {
     Serial.print("❌ MQTT: Failed, rc=");
     Serial.print(rc);
     Serial.print(" ");
-    
     switch(rc) {
       case -4: Serial.println("(TIMEOUT)"); break;
       case -3: Serial.println("(CONNECTION_LOST)"); break;
@@ -1258,7 +1277,6 @@ void setup() {
   Serial.println("║     Version 3.6 (NTP FIX)         ║");
   Serial.println("╚═══════════════════════════════════╝\n");
   
-  // Digital Inputs with Pull-ups (prevent false triggers)
   pinMode(GAS_DO, INPUT_PULLUP);
   pinMode(WATER1, INPUT_PULLUP);
   pinMode(WATER2, INPUT_PULLUP);
@@ -1268,28 +1286,21 @@ void setup() {
   pinMode(BUZZER, OUTPUT);
   digitalWrite(BUZZER, LOW);
   
-  // ADC Setup
   configureADC();
   
-  // VOLTAGE PINS: Use INPUT_PULLDOWN so they read 0 when nothing connected
-  pinMode(VOLTAGE_SENSOR_1, INPUT_PULLDOWN);
-  pinMode(VOLTAGE_SENSOR_2, INPUT_PULLDOWN);
-  
-  // CURRENT PINS: Normal input
+  pinMode(VOLTAGE_SENSOR_1, INPUT);   // ADC1, no internal pulldown
+  pinMode(VOLTAGE_SENSOR_2, INPUT);
   pinMode(CURRENT_SENSOR_1, INPUT);
   pinMode(CURRENT_SENSOR_2, INPUT);
   
-  // Initialize Servos
   initServos();
   
-  // MPU6050 Setup
   Wire.begin(21, 22);
   mpu.begin();
   Serial.println("🔧 Calibrating gyro...");
   mpu.calcGyroOffsets(true);
   Serial.println("✅ Gyro calibrated\n");
   
-  // WiFi Setup
   Serial.print("🌐 Connecting to: ");
   Serial.println(ssid);
   
@@ -1316,7 +1327,6 @@ void setup() {
     Serial.printf("║  Signal: %d dBm\n", WiFi.RSSI());
     Serial.println("╚═══════════════════════════════════╝\n");
     
-    // Get Device ID IMMEDIATELY after WiFi connects
     deviceId = getDeviceId();
     telemetryTopic = "apn/device/" + deviceId + "/telemetry";
     commandTopic = "apn/device/" + deviceId + "/commands";
@@ -1326,16 +1336,13 @@ void setup() {
     Serial.printf("   Telemetry: %s\n", telemetryTopic.c_str());
     Serial.printf("   Commands:  %s\n\n", commandTopic.c_str());
     
-    // SYNC TIME (Required for TLS/HTTPS)
     syncTime();
     
-    // MQTT Setup
     espClient.setCACert(root_ca);
     mqttClient.setServer(mqtt_broker, mqtt_port);
     mqttClient.setCallback(mqttCallback);
     mqttClient.setBufferSize(1024);
     
-    // Try connecting
     mqttReconnect();
   } else {
     Serial.println("\n❌ WiFi FAILED - Check SSID/password");
@@ -1343,7 +1350,6 @@ void setup() {
     Serial.println("   Type 'scan' to see available networks\n");
   }
   
-  // Current Sensor Calibration
   if (enableCurrentSensors) {
     Serial.println("╔═══════════════════════════════════╗");
     Serial.println("║  CURRENT SENSOR CALIBRATION       ║");
@@ -1357,16 +1363,14 @@ void setup() {
     Serial.println("✅ Current sensors calibrated\n");
   }
   
-  // Initial voltage reading test
   Serial.println("╔═══════════════════════════════════╗");
   Serial.println("║  VOLTAGE SENSOR TEST              ║");
   Serial.println("╚═══════════════════════════════════╝");
   updatePowerReadings();
   Serial.printf("   V1: %.2f V (raw: %d)\n", voltage1_V, voltage1_raw);
   Serial.printf("   V2: %.2f V (raw: %d)\n", voltage2_V, voltage2_raw);
-  Serial.printf("   Noise threshold: raw < %d = 0V\n\n", VOLTAGE_NOISE_THRESHOLD);
+  Serial.printf("   Noise threshold: raw < %d (debug only)\n\n", VOLTAGE_NOISE_THRESHOLD);
   
-  // Startup Beep
   digitalWrite(BUZZER, HIGH);
   delay(200);
   digitalWrite(BUZZER, LOW);
@@ -1381,20 +1385,14 @@ void setup() {
 void loop() {
   unsigned long now = millis();
   
-  // WiFi Reconnect Check
   if (now - lastWiFiCheck > 10000) {
     lastWiFiCheck = now;
-    
     bool wifiConnected = (WiFi.status() == WL_CONNECTED);
     
     if (wifiConnected != prevWifiConnected) {
-      if (wifiConnected) {
-        Serial.println("\n✅ WiFi CONNECTED!");
-        wifiConnecting = false;
-      } else {
-        Serial.println("\n⚠️ WiFi DISCONNECTED!");
-      }
+      Serial.println(wifiConnected ? "\n✅ WiFi CONNECTED!" : "\n⚠️ WiFi DISCONNECTED!");
       prevWifiConnected = wifiConnected;
+      if (!wifiConnected) wifiConnecting = false;
     }
     
     if (!wifiConnected && !wifiConnecting) {
@@ -1405,14 +1403,11 @@ void loop() {
     }
   }
   
-  // MQTT Reconnect
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
       if (now - lastMqttReconnectAttempt > mqttReconnectInterval) {
         lastMqttReconnectAttempt = now;
-        if (mqttReconnect()) {
-          lastMqttReconnectAttempt = 0;
-        }
+        mqttReconnect();
       }
     } else {
       mqttClient.loop();
@@ -1425,24 +1420,22 @@ void loop() {
     prevMqttConnected = currentMqttConnected;
   }
   
-  // Serial Commands
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
     cmd.toLowerCase();
     
-    if (cmd == "sensors") printSensorReadings();
-    else if (cmd == "status") printFullStatus();
-    else if (cmd == "wifi") printWiFiInfo();
-    else if (cmd == "scan") scanNetworks();
-    else if (cmd == "help") printHelp();
-    else if (cmd == "shake") testGyroShake();
-    else if (cmd == "b1off") tripBreaker(1);
-    else if (cmd == "b2off") tripBreaker(2);
+    if      (cmd == "sensors") printSensorReadings();
+    else if (cmd == "status")  printFullStatus();
+    else if (cmd == "wifi")    printWiFiInfo();
+    else if (cmd == "scan")    scanNetworks();
+    else if (cmd == "help")    printHelp();
+    else if (cmd == "shake")   testGyroShake();
+    else if (cmd == "b1off")   tripBreaker(1);
+    else if (cmd == "b2off")   tripBreaker(2);
     else if (cmd == "tripall") tripAllBreakers();
   }
   
-  // System Disabled Check
   if (!systemEnabled) {
     if (prevSystemEnabled) {
       Serial.println("⏸️ System DISABLED");
@@ -1455,10 +1448,8 @@ void loop() {
     prevSystemEnabled = true;
   }
   
-  // Handle Alerts
   handleAlerts();
   
-  // Heartbeat
   if (heartbeatInterval > 0 && (now - lastHeartbeat >= heartbeatInterval)) {
     bool anyAlert = waterAlertActive || gasAlertActive || tempAlertActive ||
                     gyroAlertActive || powerAlertActive;
@@ -1473,7 +1464,6 @@ void loop() {
     lastHeartbeat = now;
   }
   
-  // Periodic Telemetry
   if (enablePeriodicUpdates && periodicUpdateInterval > 0) {
     if (now - lastPeriodicUpdate >= periodicUpdateInterval) {
       sendSensorData(true);
